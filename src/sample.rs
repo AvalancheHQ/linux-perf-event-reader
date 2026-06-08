@@ -4,6 +4,40 @@ use crate::{BranchSampleFormat, CpuMode, RawData, RawDataU64, ReadFormat, Sample
 
 use super::{RecordParseInfo, Regs};
 
+/// The counter values carried by a sample when `PERF_SAMPLE_READ` is set.
+///
+/// When the sampling event is the leader of an event group opened with
+/// `PERF_FORMAT_GROUP`, every sample carries the current raw counter value of
+/// each group member, read atomically at the sampled instant. Taking the delta
+/// between consecutive samples gives the number of events that occurred on that
+/// thread since the previous sample.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ReadGroup {
+    /// Total time the event group was enabled, in nanoseconds.
+    /// Present only if `PERF_FORMAT_TOTAL_TIME_ENABLED` was requested.
+    pub time_enabled: Option<u64>,
+    /// Total time the event group was actually scheduled onto the PMU, in
+    /// nanoseconds. Present only if `PERF_FORMAT_TOTAL_TIME_RUNNING` was
+    /// requested. When `time_running < time_enabled` the counters were
+    /// multiplexed and the raw values should be scaled by
+    /// `time_enabled / time_running`.
+    pub time_running: Option<u64>,
+    /// One entry per event in the group, in the order the events were opened
+    /// (the leader first).
+    pub values: Vec<ReadValue>,
+}
+
+/// A single counter value within a [`ReadGroup`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ReadValue {
+    /// The raw, monotonically increasing counter value.
+    pub value: u64,
+    /// The unique id of the event this value belongs to, used to map the value
+    /// back to a specific opened event. Present only if `PERF_FORMAT_ID` was
+    /// requested.
+    pub id: Option<u64>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SampleRecord<'a> {
     pub id: Option<u64>,
@@ -16,6 +50,8 @@ pub struct SampleRecord<'a> {
     pub tid: Option<i32>,
     pub cpu: Option<u32>,
     pub period: Option<u64>,
+    /// The counter values read at this sample, if `PERF_SAMPLE_READ` was set.
+    pub read: Option<ReadGroup>,
     pub user_regs: Option<Regs<'a>>,
     pub user_stack: Option<(RawData<'a>, u64)>,
     pub callchain: Option<RawDataU64<'a>>,
@@ -102,34 +138,64 @@ impl<'a> SampleRecord<'a> {
             None
         };
 
-        if sample_format.contains(SampleFormat::READ) {
+        let read = if sample_format.contains(SampleFormat::READ) {
+            // Layout reference: `struct read_format` in <linux/perf_event.h>.
+            // GROUP: a leading `nr`, then the optional enabled/running times,
+            // then `nr` { value, [id] } entries. Non-GROUP: a single
+            // { value, [time_enabled], [time_running], [id] } entry.
             if read_format.contains(ReadFormat::GROUP) {
-                let _value = cur.read_u64::<T>()?;
-                if read_format.contains(ReadFormat::TOTAL_TIME_ENABLED) {
-                    let _time_enabled = cur.read_u64::<T>()?;
-                }
-                if read_format.contains(ReadFormat::TOTAL_TIME_RUNNING) {
-                    let _time_running = cur.read_u64::<T>()?;
-                }
-                if read_format.contains(ReadFormat::ID) {
-                    let _id = cur.read_u64::<T>()?;
-                }
-            } else {
                 let nr = cur.read_u64::<T>()?;
-                if read_format.contains(ReadFormat::TOTAL_TIME_ENABLED) {
-                    let _time_enabled = cur.read_u64::<T>()?;
-                }
-                if read_format.contains(ReadFormat::TOTAL_TIME_RUNNING) {
-                    let _time_running = cur.read_u64::<T>()?;
-                }
+                let time_enabled = if read_format.contains(ReadFormat::TOTAL_TIME_ENABLED) {
+                    Some(cur.read_u64::<T>()?)
+                } else {
+                    None
+                };
+                let time_running = if read_format.contains(ReadFormat::TOTAL_TIME_RUNNING) {
+                    Some(cur.read_u64::<T>()?)
+                } else {
+                    None
+                };
+                let mut values = Vec::with_capacity(nr as usize);
                 for _ in 0..nr {
-                    let _value = cur.read_u64::<T>()?;
-                    if read_format.contains(ReadFormat::ID) {
-                        let _id = cur.read_u64::<T>()?;
-                    }
+                    let value = cur.read_u64::<T>()?;
+                    let id = if read_format.contains(ReadFormat::ID) {
+                        Some(cur.read_u64::<T>()?)
+                    } else {
+                        None
+                    };
+                    values.push(ReadValue { value, id });
                 }
+                Some(ReadGroup {
+                    time_enabled,
+                    time_running,
+                    values,
+                })
+            } else {
+                let value = cur.read_u64::<T>()?;
+                let time_enabled = if read_format.contains(ReadFormat::TOTAL_TIME_ENABLED) {
+                    Some(cur.read_u64::<T>()?)
+                } else {
+                    None
+                };
+                let time_running = if read_format.contains(ReadFormat::TOTAL_TIME_RUNNING) {
+                    Some(cur.read_u64::<T>()?)
+                } else {
+                    None
+                };
+                let id = if read_format.contains(ReadFormat::ID) {
+                    Some(cur.read_u64::<T>()?)
+                } else {
+                    None
+                };
+                Some(ReadGroup {
+                    time_enabled,
+                    time_running,
+                    values: vec![ReadValue { value, id }],
+                })
             }
-        }
+        } else {
+            None
+        };
 
         let callchain = if sample_format.contains(SampleFormat::CALLCHAIN) {
             let callchain_length = cur.read_u64::<T>()?;
@@ -252,6 +318,7 @@ impl<'a> SampleRecord<'a> {
             pid,
             tid,
             period,
+            read,
             intr_regs,
             phys_addr,
             data_page_size,
